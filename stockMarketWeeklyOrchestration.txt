@@ -1,0 +1,154 @@
+// Step Function Code
+
+
+
+{
+  "Comment": "StockMarketWeeklyOrchestration: Pipeline to partition data, refresh Athena metadata, dynamically generate aggregated queries (gain and loss) for the current week, run the queries in parallel, and send notifications.",
+  "StartAt": "RunGlueJob",
+  "States": {
+    "RunGlueJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "stock-market-weekly-job-json-to-parquet-partioned"
+      },
+      "Next": "WaitForGlueCompletion",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.errorInfo",
+          "Next": "SendFailureNotificationGlue"
+        }
+      ]
+    },
+    "WaitForGlueCompletion": {
+      "Type": "Wait",
+      "Seconds": 120,
+      "Next": "RunPartitionRefresh"
+    },
+    "RunPartitionRefresh": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Parameters": {
+        "QueryString": "MSCK REPAIR TABLE stock_data;",
+        "QueryExecutionContext": {
+          "Database": "stockdb"
+        },
+        "ResultConfiguration": {
+          "OutputLocation": "s3://stock-market-180294199258-us-east-1/athena-queries/"
+        }
+      },
+      "Next": "WaitForPartitionRefresh",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.errorInfo",
+          "Next": "SendFailureNotificationAthena"
+        }
+      ]
+    },
+    "WaitForPartitionRefresh": {
+      "Type": "Wait",
+      "Seconds": 120,
+      "Next": "GenerateAggregatedQuery"
+    },
+    "GenerateAggregatedQuery": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:180294199258:function:stock-market-generate-aggregated-query",
+      "Next": "RunAggregatedAthenaQueries",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.errorInfo",
+          "Next": "SendFailureNotificationAthena"
+        }
+      ]
+    },
+    "RunAggregatedAthenaQueries": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "RunGainQuery",
+          "States": {
+            "RunGainQuery": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+              "Parameters": {
+                "QueryString.$": "$.queryStringGain",
+                "QueryExecutionContext": {
+                  "Database": "stockdb"
+                },
+                "ResultConfiguration": {
+                  "OutputLocation": "s3://stock-market-180294199258-us-east-1/athena-queries/"
+                }
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "RunLossQuery",
+          "States": {
+            "RunLossQuery": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+              "Parameters": {
+                "QueryString.$": "$.queryStringLoss",
+                "QueryExecutionContext": {
+                  "Database": "stockdb"
+                },
+                "ResultConfiguration": {
+                  "OutputLocation": "s3://stock-market-180294199258-us-east-1/athena-queries/"
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "SendSuccessNotification",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.errorInfo",
+          "Next": "SendFailureNotificationAthena"
+        }
+      ]
+    },
+    "SendSuccessNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "Message": "Weekly Stock Data Pipeline completed successfully",
+        "TopicArn": "arn:aws:sns:us-east-1:180294199258:stockDataSourceDE"
+      },
+      "End": true
+    },
+    "SendFailureNotificationGlue": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "Message.$": "States.Format('Weekly Stock Data Pipeline FAILED during Glue job. Error: {}', $.errorInfo.Cause)",
+        "TopicArn": "arn:aws:sns:us-east-1:180294199258:stockDataSourceDE"
+      },
+      "End": true
+    },
+    "SendFailureNotificationAthena": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "Message.$": "States.Format('Weekly Stock Data Pipeline FAILED during Athena query. Error: {}', $.errorInfo.Cause)",
+        "TopicArn": "arn:aws:sns:us-east-1:180294199258:stockDataSourceDE"
+      },
+      "End": true
+    }
+  }
+}
